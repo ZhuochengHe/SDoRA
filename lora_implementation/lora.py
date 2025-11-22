@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,7 +23,7 @@ class LoRA_Linear(nn.Module):
         if r > 0:
             self.lora_A = nn.Linear(self.in_features, r, bias=False)
             self.lora_B = nn.Linear(r, self.out_features, bias=False)
-            nn.init.normal_(self.lora_A.weight)
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight)
 
             self.lora_dropout = nn.Dropout(lora_dropout) \
