@@ -1,6 +1,8 @@
-# Using SoRA Minimal: A Step-by-Step Guide
+# Using SoRA: A Step-by-Step Guide
 
-This guide explains how to use the minimal SoRA implementation (`sora_minimal.py`) based on the example in `train_sora.py`. SoRA (Sparse Low-Rank Adaptation) is a parameter-efficient fine-tuning method that adds sparse, low-rank branches to transformer layers.
+This guide explains how to use the SoRA implementation (`sora.py`) based on the example in `train_sora.py`. SoRA (Sparse Low-Rank Adaptation) is a parameter-efficient fine-tuning method that adds sparse, low-rank branches to transformer layers.
+
+**Note**: SoRA inherits from LoRA, sharing the same base structure while adding a gating mechanism for sparsity.
 
 ## Prerequisites
 
@@ -10,10 +12,10 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 
-from sora_minimal import (
+from sora import (
     wrap_linears,
     build_sora_optimizers,
-    SoRALinear,
+    SoRA_Linear,
 )
 ```
 
@@ -44,16 +46,16 @@ for layer_idx in range(12):  # RoBERTa has 12 encoder layers
 
 ## Step 3: Wrap Model with SoRA
 
-Apply SoRA to the selected layers. This replaces the original linear layers with `SoRALinear` modules:
+Apply SoRA to the selected layers. This replaces the original linear layers with `SoRA_Linear` modules:
 
 ```python
-wrap_linears(model, target_layers, r=32, alpha=16, dropout=0.05)
+wrap_linears(model, target_layers, r=32, lora_alpha=16, lora_dropout=0.05)
 ```
 
 **Parameters:**
 - `r`: Low-rank dimension (rank of A and B matrices)
-- `alpha`: Scaling factor for the adaptation strength
-- `dropout`: Dropout probability for the low-rank branch
+- `lora_alpha`: Scaling factor for the adaptation strength (consistent with LoRA/DoRA naming)
+- `lora_dropout`: Dropout probability for the low-rank branch (consistent with LoRA/DoRA naming)
 
 ## Step 4: Prepare Data
 
@@ -183,10 +185,10 @@ while current_xi <= xi_max:
 After training, you can prune the model to remove zeroed-out ranks, or merge the weights into the base model for zero-overhead inference.
 
 ### Pruning
-Physically removes rows/columns where the gate is zero. The model remains a `SoRALinear` but with reduced rank.
+Physically removes rows/columns where the gate is zero. The model remains a `SoRA_Linear` but with reduced rank.
 
 ```python
-from sora_minimal import prune_sora_model
+from sora import prune_sora_model
 
 prune_sora_model(model)
 # Verify performance...
@@ -196,7 +198,7 @@ prune_sora_model(model)
 Merges the adapter weights into the base model weights and removes the adapter entirely. The model becomes a standard dense model.
 
 ```python
-from sora_minimal import merge_sora_model
+from sora import merge_sora_model
 
 merge_sora_model(model)
 # Verify performance...
@@ -250,7 +252,7 @@ def summarize_gate_sparsity(model: torch.nn.Module) -> float:
     total = 0
     zeros = 0
     for module in model.modules():
-        if isinstance(module, SoRALinear) and module.gate is not None:
+        if isinstance(module, SoRA_Linear) and module.gate is not None:
             gate = module.gate.data
             total += gate.numel()
             zeros += (gate == 0).sum().item()

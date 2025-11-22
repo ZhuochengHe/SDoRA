@@ -3,10 +3,10 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
 
-from sora_minimal import (
+from sora_implementation.sora import (
     wrap_linears,
     build_sora_optimizers,
-    SoRALinear,
+    SoRA_Linear,
     prune_sora_model,
     merge_sora_model,
 )
@@ -26,7 +26,7 @@ for layer_idx in range(12):
             f"{prefix}.output.dense",
         ]
     )
-wrap_linears(model, target_layers, r=32, alpha=16, dropout=0.05)
+wrap_linears(model, target_layers, r=32, lora_alpha=16, lora_dropout=0.05)
 
 # 2. Build dataloaders (GLUE/SST-2 example)
 def encode_batch(batch):
@@ -76,7 +76,7 @@ def summarize_gate_sparsity(model: torch.nn.Module) -> float:
     total = 0
     zeros = 0
     for module in model.modules():
-        if isinstance(module, SoRALinear) and module.gate is not None:
+        if isinstance(module, SoRA_Linear) and module.gate is not None:
             gate = module.gate.data
             total += gate.numel()
             zeros += (gate.abs() < eps).sum().item()
@@ -86,10 +86,10 @@ def summarize_gate_sparsity(model: torch.nn.Module) -> float:
 def dump_sora_weights(model: torch.nn.Module) -> None:
     print("\n=== SoRA parameter dump ===")
     for name, module in model.named_modules():
-        if isinstance(module, SoRALinear) and module.gate is not None:
+        if isinstance(module, SoRA_Linear) and module.gate is not None:
             print(f"Module: {name}")
-            print("lora_A:\n", module.lora_A.data)
-            print("lora_B:\n", module.lora_B.data)
+            print("lora_A:\n", module.lora_A.weight.data)
+            print("lora_B:\n", module.lora_B.weight.data)
             print("gate:\n", module.gate.data)
 
 def train_one_epoch(model, train_loader, base_opt, gate_opt, base_scheduler, gate_scheduler, epoch_idx):
@@ -134,10 +134,47 @@ def train_one_epoch(model, train_loader, base_opt, gate_opt, base_scheduler, gat
             running_correct = 0
             running_examples = 0
 
-# 5. Training loop with Scheduling (Algorithm 1)
+# 5. Training loop with Fixed Lambda (Recommended)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
+# Fixed sparsity parameter
+sparse_lambda = 0.3  # Use a fixed value (0.2-0.4 works well for most tasks)
+num_epochs = 5
+
+# Build optimizers once with fixed lambda
+gate_opt, base_opt = build_sora_optimizers(
+    model,
+    base_lr=base_lr,
+    gate_lr=gate_lr,
+    sparse_lambda=sparse_lambda,
+    betas=(0.9, 0.98),
+    weight_decay=weight_decay,
+)
+
+num_training_steps = len(train_loader) * num_epochs
+base_scheduler = get_linear_schedule_with_warmup(
+    base_opt, num_warmup_steps=int(0.1 * num_training_steps), num_training_steps=num_training_steps
+)
+gate_scheduler = get_linear_schedule_with_warmup(
+    gate_opt, num_warmup_steps=int(0.1 * num_training_steps), num_training_steps=num_training_steps
+)
+
+# Training loop
+for epoch in range(1, num_epochs + 1):
+    train_one_epoch(model, train_loader, base_opt, gate_opt, base_scheduler, gate_scheduler, epoch)
+    
+    val_loss, val_acc = evaluate(model, val_loader)
+    gate_zero_ratio = summarize_gate_sparsity(model)
+    print(
+        f"Epoch {epoch} validation -> loss: {val_loss:.4f}, acc: {val_acc:.4f}, gate zero ratio: {gate_zero_ratio:.4f}"
+    )
+
+# ============================================================================
+# OPTIONAL: Scheduling (Algorithm 1) - For research experiments only
+# ============================================================================
+# Uncomment below to explore accuracy vs sparsity curves with progressive lambda
+"""
 # Scheduler parameters
 xi_start = 0.0
 xi_max = 0.5
@@ -151,10 +188,6 @@ while current_xi <= xi_max + 1e-6:
     print(f"\n=== Starting Stage {stage} with lambda (xi) = {current_xi:.2f} ===")
     
     # Rebuild optimizers with new lambda
-    # Note: In a real scenario, we might want to preserve optimizer state (momentum),
-    # but changing lambda in SoRAOptimizer requires re-init or manual update.
-    # Here we re-init for simplicity as per Algorithm 1 implication "Update(M, D, xi)".
-    
     gate_opt, base_opt = build_sora_optimizers(
         model,
         base_lr=base_lr,
@@ -183,6 +216,8 @@ while current_xi <= xi_max + 1e-6:
 
     current_xi += xi_step
     stage += 1
+"""
+# ============================================================================
 
 dump_sora_weights(model)
 

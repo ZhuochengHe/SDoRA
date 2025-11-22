@@ -1,1 +1,1 @@
-from .sora_minimal import SoRA_Linear
+from .sora import SoRA_Linear

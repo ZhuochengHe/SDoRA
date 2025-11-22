@@ -9,56 +9,56 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 
+from lora_implementation import LoRA_Linear
 
-class SoRA_Linear(nn.Module):
-    """Adds a sparse low-rank branch next to a frozen linear layer."""
+class SoRA_Linear(LoRA_Linear):
+    """Adds a sparse low-rank branch next to a frozen linear layer with gating mechanism."""
 
     def __init__(
         self,
-        base_layer: nn.Linear,
-        r: int = 8,
-        alpha: int = 16,
-        dropout: float = 0.0,
+        base_linear,
+        r=8,
+        lora_alpha=16.0,
+        lora_dropout=0.0,
+        merged: bool = False,
+        **kwargs,
     ) -> None:
-        super().__init__()
-        if not isinstance(base_layer, nn.Linear):
-            raise TypeError("base_layer must be nn.Linear")
-        self.base = base_layer
-        for param in self.base.parameters():
-            param.requires_grad = False
-
-        self.rank = r
-        self.scaling = alpha / max(r, 1)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else (lambda x: x)
-
+        super().__init__(
+            base_linear=base_linear,
+            r=r,
+            lora_alpha=lora_alpha,
+            lora_dropout=lora_dropout,
+            **kwargs
+        )
+        
+        # Add gate parameter (SoRA-specific)
         if r > 0:
-            self.lora_A = nn.Parameter(base_layer.weight.new_zeros((r, base_layer.in_features)))
-            self.lora_B = nn.Parameter(base_layer.weight.new_zeros((base_layer.out_features, r)))
             self.gate = nn.Parameter(torch.ones(1, r))
-            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-            nn.init.zeros_(self.lora_B)
         else:
-            self.register_parameter("lora_A", None)
-            self.register_parameter("lora_B", None)
             self.register_parameter("gate", None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        result = self.base(x)
-        if self.rank == 0:
+        result = self.linear(x)
+        if self.r == 0 or self.merged:
             return result
         
+        # Apply dropout
+        x_dropout = self.lora_dropout(x)
+        
         if self.gate is not None:
-            delta = (self.dropout(x) @ self.lora_A.T).mul(self.gate) @ self.lora_B.T
+            # SoRA: gated low-rank adaptation
+            # (x @ A.T * gate) @ B.T
+            delta = (x_dropout @ self.lora_A.weight.T).mul(self.gate) @ self.lora_B.weight.T
         else:
             # Pruned mode (standard LoRA)
-            delta = (self.dropout(x) @ self.lora_A.T) @ self.lora_B.T
+            delta = (x_dropout @ self.lora_A.weight.T) @ self.lora_B.weight.T
             
         return result + delta * self.scaling
 
-    @torch.no_grad()
+    @torch.no_grad
     def prune(self) -> None:
         """Prune zeroed-out ranks and merge gate into weights."""
-        if self.gate is None:
+        if self.gate is None or self.r == 0:
             return
 
         # Identify non-zero indices
@@ -67,56 +67,68 @@ class SoRA_Linear(nn.Module):
         new_rank = non_zero_indices.numel()
 
         if new_rank == 0:
-            self.rank = 0
+            self.r = 0
             self.lora_A = None
             self.lora_B = None
             self.gate = None
             return
 
-        # Select rows/cols
-        # lora_A: (r, in) -> (new_r, in)
-        new_A = self.lora_A.data[non_zero_indices].clone()
+        # Select rows/cols from lora_A.weight and lora_B.weight
+        # lora_A.weight: (r, in) -> (new_r, in)
+        new_A_weight = self.lora_A.weight.data[non_zero_indices].clone()
         
-        # lora_B: (out, r) -> (out, new_r)
+        # lora_B.weight: (out, r) -> (out, new_r)
         # Merge gate: B_new = B_old * gate
-        # B: (out, r), gate: (1, r)
-        new_B = self.lora_B.data[:, non_zero_indices].clone()
+        new_B_weight = self.lora_B.weight.data[:, non_zero_indices].clone()
         gate_values = gate_data[non_zero_indices]
-        new_B = new_B * gate_values.view(1, -1)
+        new_B_weight = new_B_weight * gate_values.view(1, -1)
 
-        # Update parameters
-        self.rank = new_rank
-        self.lora_A = nn.Parameter(new_A)
-        self.lora_B = nn.Parameter(new_B)
+        # Update parameters (create new nn.Linear modules with correct shapes)
+        self.r = new_rank
+        self.lora_A = nn.Linear(self.in_features, new_rank, bias=False)
+        self.lora_B = nn.Linear(new_rank, self.out_features, bias=False)
+        self.lora_A.weight.data = new_A_weight  # Shape already (new_r, in)
+        self.lora_B.weight.data = new_B_weight  # Shape already (out, new_r)
         self.gate = None # Remove gate
 
-    @torch.no_grad()
+    @torch.no_grad
     def merge(self) -> None:
         """Merge the LoRA branch into the base layer weights for maximum inference speed."""
-        if self.rank == 0 or self.lora_A is None:
+        if self.r == 0 or self.lora_A is None or self.merged:
             return
 
         # Calculate delta: B @ A * scaling
         # If gate exists, include it: B @ diag(g) @ A
         
         if self.gate is not None:
-            # B: (out, r), gate: (1, r) -> B_scaled: (out, r)
-            B_scaled = self.lora_B.data * self.gate.data.view(1, -1)
+            # B.weight: (out, r), gate: (1, r) -> B_scaled: (out, r)
+            B_scaled = self.lora_B.weight.data * self.gate.data.view(1, -1)
         else:
-            B_scaled = self.lora_B.data
+            B_scaled = self.lora_B.weight.data
             
-        # A: (r, in)
-        # delta = B_scaled @ A
-        weight_delta = (B_scaled @ self.lora_A.data) * self.scaling
+        # A.weight: (r, in)
+        # delta = B_scaled @ A.weight
+        weight_delta = (B_scaled @ self.lora_A.weight.data) * self.scaling
         
         # Add to base weight
-        self.base.weight.data += weight_delta.to(self.base.weight.device)
-        
-        # Remove LoRA params completely
-        self.rank = 0
-        self.lora_A = None
-        self.lora_B = None
-        self.gate = None
+        self.linear.weight.data += weight_delta.to(self.linear.weight.device)
+        self.merged = True
+
+    @torch.no_grad
+    def unmerge(self) -> None:
+        """Unmerge the LoRA branch from the base layer weights."""
+        if self.r == 0 or self.lora_A is None or not self.merged:
+            return
+
+        # Calculate delta: B @ A * scaling
+        if self.gate is not None:
+            B_scaled = self.lora_B.weight.data * self.gate.data.view(1, -1)
+        else:
+            B_scaled = self.lora_B.weight.data
+            
+        weight_delta = (B_scaled @ self.lora_A.weight.data) * self.scaling
+        self.linear.weight.data -= weight_delta.to(self.linear.weight.device)
+        self.merged = False 
 
 
 
@@ -124,10 +136,10 @@ def wrap_linears(
     module: nn.Module,
     target_names: Sequence[str],
     r: int = 8,
-    alpha: int = 16,
-    dropout: float = 0.0,
+    lora_alpha: float = 16.0,
+    lora_dropout: float = 0.0,
 ) -> None:
-    """Replace the listed nn.Linear modules with SoRALinear in-place."""
+    """Replace the listed nn.Linear modules with SoRA_Linear in-place."""
 
     name_to_module = dict(module.named_modules())
     for name in target_names:
@@ -136,7 +148,7 @@ def wrap_linears(
         child = getattr(parent, child_name, None)
         if not isinstance(child, nn.Linear):
             raise ValueError(f"Target '{name}' is not nn.Linear")
-        setattr(parent, child_name, SoRALinear(child, r=r, alpha=alpha, dropout=dropout))
+        setattr(parent, child_name, SoRA_Linear(child, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout))
 
 
 class SoRAOptimizer(AdamW):
@@ -203,13 +215,13 @@ def build_sora_optimizers(
 
 
 def prune_sora_model(model: nn.Module) -> None:
-    """Convert all SoRALinear modules in the model to pruned LoRA form."""
+    """Convert all SoRA_Linear modules in the model to pruned LoRA form."""
     for module in model.modules():
-        if isinstance(module, SoRALinear):
+        if isinstance(module, SoRA_Linear):
             module.prune()
 
 def merge_sora_model(model: nn.Module) -> None:
-    """Merge all SoRALinear modules in the model into their base weights."""
+    """Merge all SoRA_Linear modules in the model into their base weights."""
     for module in model.modules():
-        if isinstance(module, SoRALinear):
+        if isinstance(module, SoRA_Linear):
             module.merge()
