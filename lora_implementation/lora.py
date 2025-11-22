@@ -28,6 +28,10 @@ class LoRA_Linear(nn.Module):
 
             self.lora_dropout = nn.Dropout(lora_dropout) \
                 if lora_dropout > 0 else (lambda x: x)
+        else:
+            self.register_parameter("lora_A", None)
+            self.register_parameter("lora_B", None)
+            self.register_parameter("lora_dropout", None)
 
     def forward(self, x):
         if self.r > 0 and not self.merged:
