@@ -36,32 +36,27 @@ class Dora_Linear(LoRA_Linear):
 
             result += ( norm_scale * (self.lora_B(self.lora_A(dropout_x)))) * self.scaling
         else:
-             result = F.linear(x, self.linear.weight, bias=self.linear.bias)
+            result = F.linear(x, self.linear.weight, bias=self.linear.bias)
         
         return result
         
     @torch.no_grad
     def merge(self):
         if self.r > 0 and not self.merged:
-            self._orig_weight = self.linear.weight.data.clone().detach()
+            self._v_norm = torch.linalg.norm(self.linear.weight,dim=1).clone().detach()
             new_weight_v = self.linear.weight + (self.lora_B.weight @ self.lora_A.weight) * self.scaling
             norm_scale = self.weight_m_wdecomp.weight.view(-1) / (torch.linalg.norm(new_weight_v,dim=1)).detach()
             self.linear.weight.data = new_weight_v * norm_scale.view(-1,1)
-            # self.linear.weight.data += (self.lora_B.weight @ self.lora_A.weight) * self.scaling * norm_scale.view(-1,1)
             self.merged = True
 
     @torch.no_grad
     def unmerge(self):
         if self.r > 0 and self.merged:
-            if hasattr(self, "_orig_weight"):
-                self.linear.weight.data = self._orig_weight
-                del self._orig_weight
+            if hasattr(self, "_v_norm"):
+                new_weight_v = self._v_norm.view(-1,1) * self.linear.weight.data / self.weight_m_wdecomp.weight.view(-1,1)
+                self.linear.weight.data = new_weight_v - (self.lora_B.weight @ self.lora_A.weight) * self.scaling
+                del self._v_norm
                 self.merged = False
-            # new_weight_v = self.linear.weight + (self.lora_B.weight @ self.lora_A.weight) * self.scaling
-            # norm_scale = self.weight_m_wdecomp.weight.view(-1) / (torch.linalg.norm(self.linear.weight,dim=1)).detach()
-            # self.linear.weight.data = self.linear.weight.data / norm_scale.view(-1, 1) - (self.lora_B.weight @ self.lora_A.weight) * self.scaling
-            # self.linear.weight.data = (self.linear.weight.data - (self.lora_B.weight @ self.lora_A.weight) * self.scaling * norm_scale.view(-1,1)) / norm_scale.view(-1,1)
-
 
     
 
