@@ -1,0 +1,238 @@
+# Using SoRA Minimal: A Step-by-Step Guide
+
+This guide explains how to use the minimal SoRA implementation (`sora_minimal.py`) based on the example in `train_sora.py`. SoRA (Sparse Low-Rank Adaptation) is a parameter-efficient fine-tuning method that adds sparse, low-rank branches to transformer layers.
+
+## Prerequisites
+
+```python
+import torch
+from torch.nn.utils import clip_grad_norm_
+from torch.utils.data import DataLoader
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, get_linear_schedule_with_warmup
+
+from sora_minimal import (
+    wrap_linears,
+    build_sora_optimizers,
+    SoRALinear,
+)
+```
+
+## Step 1: Load Model and Tokenizer
+
+Load a pre-trained transformer model and its tokenizer:
+
+```python
+model_name = "roberta-base"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+```
+
+## Step 2: Select Target Layers
+
+Choose which linear layers to adapt. For RoBERTa, target attention and feed-forward layers:
+
+```python
+target_layers = []
+for layer_idx in range(12):  # RoBERTa has 12 encoder layers
+    prefix = f"roberta.encoder.layer.{layer_idx}"
+    target_layers.extend([
+        f"{prefix}.attention.output.dense",    # Attention output projection
+        f"{prefix}.intermediate.dense",        # Feed-forward expansion
+        f"{prefix}.output.dense",              # Feed-forward contraction
+    ])
+```
+
+## Step 3: Wrap Model with SoRA
+
+Apply SoRA to the selected layers. This replaces the original linear layers with `SoRALinear` modules:
+
+```python
+wrap_linears(model, target_layers, r=32, alpha=16, dropout=0.05)
+```
+
+**Parameters:**
+- `r`: Low-rank dimension (rank of A and B matrices)
+- `alpha`: Scaling factor for the adaptation strength
+- `dropout`: Dropout probability for the low-rank branch
+
+## Step 4: Prepare Data
+
+Create data loaders for your dataset. Here's an example for GLUE SST-2:
+
+```python
+def encode_batch(batch):
+    sentences = [sample["sentence"] for sample in batch]
+    labels = torch.tensor([sample["label"] for sample in batch], dtype=torch.long)
+    encoded = tokenizer(sentences, padding=True, truncation=True, return_tensors="pt")
+    encoded["labels"] = labels
+    return encoded
+
+from datasets import load_dataset
+dataset = load_dataset("glue", "sst2")
+train_loader = DataLoader(dataset["train"], batch_size=32, shuffle=True, collate_fn=encode_batch)
+val_loader = DataLoader(dataset["validation"], batch_size=64, shuffle=False, collate_fn=encode_batch)
+```
+
+## Step 5: Build Optimizers
+
+Create separate optimizers for gate parameters (SoRA) and base model parameters. We use a higher learning rate for gates to encourage faster sparsification:
+
+```python
+gate_opt, base_opt = build_sora_optimizers(
+    model,
+    base_lr=1e-4,        # Learning rate for base parameters
+    gate_lr=1e-3,        # Higher LR for gate parameters (10x base_lr)
+    sparse_lambda=1.0,   # Sparsity regularization strength
+    betas=(0.9, 0.98),   # AdamW betas
+    weight_decay=0.01,   # Weight decay
+)
+```
+
+**Key Parameters:**
+- `gate_lr`: Set higher than `base_lr` to allow the soft-thresholding mechanism to effectively prune gate values (which start at 1.0).
+- `sparse_lambda`: Controls sparsity threshold. The actual threshold is `sparse_lambda * current_lr`.
+- The function automatically splits parameters: gate parameters go to `gate_opt`, others to `base_opt`.
+
+## Step 6: Set Up Schedulers (Optional)
+
+Add learning rate schedulers. We use a very short warmup for gates to start pruning early:
+
+```python
+num_epochs = 3
+num_training_steps = len(train_loader) * num_epochs
+
+base_scheduler = get_linear_schedule_with_warmup(
+    base_opt, num_warmup_steps=int(0.1 * num_training_steps), num_training_steps=num_training_steps
+)
+gate_scheduler = get_linear_schedule_with_warmup(
+    gate_opt, 
+    num_warmup_steps=int(0.02 * num_training_steps), # Short warmup (2%) for stability
+    num_training_steps=num_training_steps
+)
+```
+
+## Step 7: Define Evaluation Function
+
+Create a function to evaluate model performance:
+
+```python
+def evaluate(model: torch.nn.Module, dataloader: DataLoader) -> tuple[float, float]:
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    with torch.no_grad():
+        for batch in dataloader:
+            batch = {k: v.to(model.device) for k, v in batch.items()}
+            labels = batch.pop("labels")
+            outputs = model(**batch, labels=labels)
+            loss = outputs.loss
+            logits = outputs.logits
+            total_loss += loss.item() * labels.size(0)
+            preds = logits.argmax(dim=-1)
+            total_correct += (preds == labels).sum().item()
+            total_samples += labels.size(0)
+    model.train()
+    return total_loss / total_samples, total_correct / total_samples
+```
+
+## Step 8: Monitor Sparsity
+
+Track how many gate parameters have been pruned to zero:
+
+```python
+def summarize_gate_sparsity(model: torch.nn.Module) -> float:
+    total = 0
+    zeros = 0
+    for module in model.modules():
+        if isinstance(module, SoRALinear) and module.gate is not None:
+            gate = module.gate.data
+            total += gate.numel()
+            zeros += (gate == 0).sum().item()
+    return zeros / total if total > 0 else 0.0
+```
+
+## Step 9: Training Loop
+
+The main training loop with gradient accumulation, optimization, and logging:
+
+```python
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+global_step = 0
+for epoch in range(1, num_epochs + 1):
+    running_loss = 0.0
+    running_correct = 0
+    running_examples = 0
+
+    for batch in train_loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        labels = batch.pop("labels")
+
+        # Forward pass
+        outputs = model(**batch, labels=labels)
+        loss = outputs.loss
+        loss.backward()
+
+        # Gradient clipping
+        clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # Accuracy tracking
+        preds = outputs.logits.argmax(dim=-1)
+        running_correct += (preds == labels).sum().item()
+        running_examples += labels.size(0)
+
+        # Optimization steps
+        gate_opt.step()
+        base_opt.step()
+        gate_scheduler.step()
+        base_scheduler.step()
+        gate_opt.zero_grad()
+        base_opt.zero_grad()
+
+        # Logging
+        running_loss += loss.item()
+        global_step += 1
+        if global_step % 100 == 0:
+            avg_loss = running_loss / 100
+            avg_acc = running_correct / running_examples if running_examples else 0.0
+            print(f"Epoch {epoch} | Step {global_step} | loss = {avg_loss:.4f} | accuracy = {avg_acc:.4f}")
+            running_loss = 0.0
+            running_correct = 0
+            running_examples = 0
+
+    # End-of-epoch evaluation
+    val_loss, val_acc = evaluate(model, val_loader)
+    gate_zero_ratio = summarize_gate_sparsity(model)
+    print(f"Epoch {epoch} validation -> loss: {val_loss:.4f}, acc: {val_acc:.4f}, gate zero ratio: {gate_zero_ratio:.4f}")
+```
+
+## Key Concepts
+
+1. **Split Optimization**: Gate parameters (controlling sparsity) are optimized separately from base model parameters.
+
+2. **Proximal Gradient**: The `gate_opt.step()` applies soft thresholding to induce sparsity.
+
+3. **Layer Selection**: Choose layers that have the most impact on task performance (attention and feed-forward layers).
+
+4. **Hyperparameter Tuning**:
+   - `r`: Higher rank = more capacity but more parameters
+   - `sparse_lambda`: Higher = more sparsity
+   - `alpha`: Higher = stronger adaptation
+
+## Customization
+
+- **Different Models**: Change `model_name` and adjust `target_layers` for other architectures
+- **Custom Datasets**: Modify `encode_batch` and data loading logic
+- **Advanced Scheduling**: Implement custom learning rate schedules or sparsity schedules
+- **Multi-GPU**: Add `torch.nn.DataParallel` or distributed training
+
+## Expected Output
+
+After training, you should see:
+- Decreasing loss and increasing accuracy
+- Increasing `gate_zero_ratio` (sparsity)
+- Final parameter dump showing pruned gates
+
+This minimal implementation provides full control over the training process while maintaining the core SoRA algorithm.
