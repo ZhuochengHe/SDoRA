@@ -21,7 +21,7 @@ def replace_linear_with_lora(model, target_modules, lora_type="lora", **kwargs):
             parent = model.get_submodule(".".join(name.split(".")[:-1]))
             child_name = name.split(".")[-1]
 
-            new_module = lora_cls(linear=module, **kwargs)
+            new_module = lora_cls(base_linear=module, **kwargs)
 
             new_module.linear.weight.data.copy_(module.weight.data)
             if module.bias is not None:
