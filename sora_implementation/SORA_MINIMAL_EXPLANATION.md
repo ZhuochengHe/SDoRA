@@ -37,7 +37,8 @@ This document explains the structural and architectural differences between the 
 ### `sora_minimal.py` Implementation
 - **Definition**: `SoRAOptimizer` inherits directly from `torch.optim.AdamW`.
 - **Integration**: It executes the soft-thresholding operation (threshold fixed at `sparse_lambda * lr`) at the end of its own `step()` method.
-- **Independence**: It does not rely on Trainer callbacks or external schedules. (Note: Lambda scheduling logic can be easily ported into this class if needed).
+- **Independence**: It does not rely on Trainer callbacks or external schedules.
+- **Correctness**: It strictly enforces `weight_decay=0.0` for gate parameters to solve the pure Lasso ($L_1$) problem, avoiding the Elastic Net ($L_1 + L_2$) formulation that would occur if weight decay were applied.
 
 ---
 
@@ -51,3 +52,18 @@ This document explains the structural and architectural differences between the 
 - **Logic**: Provides an explicit `split_sora_params(model)` function.
 - **Process**: It iterates through `model.named_parameters()`. Any parameter ending with `"gate"` (and requiring gradients) is classified as a gate parameter.
 - **Usage**: `build_sora_optimizers` explicitly returns a tuple: `(gate_optimizer, regular_optimizer)`. The user manually calls `gate_opt.step()` and `regular_opt.step()` in their custom training loop. This decouples the optimization logic from the HuggingFace `Trainer`, making it easier to transplant into custom scripts.
+
+---
+
+## 5. Pruning and Merging (New Features)
+
+### Pruning (`prune_sora_model`)
+- **Purpose**: To physically remove the dimensions (ranks) that have been zeroed out by the gate during training.
+- **Mechanism**: The `prune()` method in `SoRALinear` identifies indices where the gate is zero. It then creates new, smaller `lora_A` and `lora_B` matrices containing only the active ranks. The gate parameter is then removed, and the scaling is baked into the weights.
+- **Benefit**: Reduces the parameter count and memory footprint of the adapter without affecting the output.
+
+### Merging (`merge_sora_model`)
+- **Purpose**: To achieve zero-overhead inference by merging the adapter weights into the base model weights.
+- **Mechanism**: The `merge()` method computes the effective weight update $\Delta W = (B \cdot \text{diag}(g) \cdot A) \times \text{scaling}$ and adds it directly to the frozen `base_layer.weight`. The entire LoRA branch is then discarded.
+- **Benefit**: The model becomes a standard dense model again, with no additional inference latency compared to the original base model.
+

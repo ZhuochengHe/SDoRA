@@ -82,9 +82,9 @@ gate_opt, base_opt = build_sora_optimizers(
     model,
     base_lr=1e-4,        # Learning rate for base parameters
     gate_lr=1e-3,        # Higher LR for gate parameters (10x base_lr)
-    sparse_lambda=1.0,   # Sparsity regularization strength
+    sparse_lambda=0.0,   # Initial sparsity regularization strength (can be scheduled)
     betas=(0.9, 0.98),   # AdamW betas
-    weight_decay=0.01,   # Weight decay
+    weight_decay=0.01,   # Weight decay (automatically set to 0.0 for gates)
 )
 ```
 
@@ -92,12 +92,117 @@ gate_opt, base_opt = build_sora_optimizers(
 - `gate_lr`: Set higher than `base_lr` to allow the soft-thresholding mechanism to effectively prune gate values (which start at 1.0).
 - `sparse_lambda`: Controls sparsity threshold. The actual threshold is `sparse_lambda * current_lr`.
 - The function automatically splits parameters: gate parameters go to `gate_opt`, others to `base_opt`.
+- **Note**: `weight_decay` is forced to `0.0` for `gate_opt` to ensure a pure Lasso ($L_1$) optimization problem.
 
-## Step 6: Set Up Schedulers (Optional)
+## Step 6: Training Loop
 
-Add learning rate schedulers. We use a very short warmup for gates to start pruning early:
+### Basic Training (Recommended for Most Use Cases)
+
+For normal usage, use a **fixed `sparse_lambda`** throughout training:
 
 ```python
+# Use a single fixed lambda value
+gate_opt, base_opt = build_sora_optimizers(
+    model,
+    base_lr=1e-4,
+    gate_lr=1e-3,
+    sparse_lambda=0.4,  # Fixed value (0.3-0.5 works well)
+    betas=(0.9, 0.98),
+    weight_decay=0.01,
+)
+
+# Train normally
+for epoch in range(num_epochs):
+    for batch in train_loader:
+        # ... forward pass, loss.backward() ...
+        base_opt.step()
+        gate_opt.step()
+        base_opt.zero_grad()
+        gate_opt.zero_grad()
+```
+
+### Advanced: Scheduling λ (Algorithm 1) - Research Use Only
+
+**Note**: Scheduling is an **experimental tool** for exploring compression curves, not required for normal SoRA usage.
+
+#### How It Works
+
+**Stage** = A training phase using a fixed `xi` (sparse lambda) value. By training with progressively larger `xi`, you explore model performance at different sparsity levels.
+
+**Relationship**: `xi` → `threshold` → `gate_zero_ratio` → `sparsity`
+
+- Larger `xi` → Higher threshold in soft-thresholding → More gates pushed to 0 → Higher sparsity
+- Each stage produces a different sparsity level, letting you plot **accuracy vs sparsity curves**
+
+**Example**: With `xi_start=0.0, xi_max=0.5, xi_step=0.1`, you get **6 stages**:
+
+| Stage | xi | Expected Gate Zero Ratio | Purpose |
+|---|---|---|---|
+| 0 | 0.0 | ~0% | Dense baseline |
+| 1 | 0.1 | ~20% | Mild sparsity |
+| 2 | 0.2 | ~40% | Moderate sparsity |
+| 3 | 0.3 | ~60% | High sparsity |
+| 4 | 0.4 | ~75% | Very high sparsity |
+| 5 | 0.5 | ~85% | Extreme sparsity |
+
+Each stage trains for `epochs_per_stage` epochs (e.g., 3), giving you data points to analyze the compression-performance tradeoff.
+
+#### Code Example
+
+```python
+# WARNING: This is for research experiments only
+xi_start = 0.0
+xi_max = 0.5
+xi_step = 0.1
+epochs_per_stage = 3
+
+current_xi = xi_start
+stage = 0
+
+while current_xi <= xi_max:
+    print(f"Stage {stage}: xi={current_xi}")
+    
+    gate_opt, base_opt = build_sora_optimizers(
+        model, sparse_lambda=current_xi, ...
+    )
+    
+    for epoch in range(epochs_per_stage):
+        train_one_epoch(...)
+        # Record: val_acc, gate_zero_ratio
+    
+    current_xi += xi_step
+    stage += 1
+
+# Result: 6 stages × 3 epochs = 18 total epochs
+```
+
+**Use scheduling only if**: You want to study how sparsity affects performance and plot compression curves. For production models, use a single fixed `sparse_lambda`.
+
+## Step 7: Pruning and Merging
+
+After training, you can prune the model to remove zeroed-out ranks, or merge the weights into the base model for zero-overhead inference.
+
+### Pruning
+Physically removes rows/columns where the gate is zero. The model remains a `SoRALinear` but with reduced rank.
+
+```python
+from sora_minimal import prune_sora_model
+
+prune_sora_model(model)
+# Verify performance...
+```
+
+### Merging
+Merges the adapter weights into the base model weights and removes the adapter entirely. The model becomes a standard dense model.
+
+```python
+from sora_minimal import merge_sora_model
+
+merge_sora_model(model)
+# Verify performance...
+# Save the merged model
+model.save_pretrained("path/to/merged_model")
+```
 num_epochs = 3
 num_training_steps = len(train_loader) * num_epochs
 
