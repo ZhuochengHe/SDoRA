@@ -48,9 +48,6 @@ base_lr = 1e-4
 gate_lr = 1e-3
 weight_decay = 0.01
 
-# 4. Learning rate schedulers
-# Moved to training loop
-
 def evaluate(model: torch.nn.Module, dataloader: DataLoader) -> tuple[float, float]:
     model.eval()
     total_loss = 0.0
