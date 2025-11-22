@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 from lora_implementation import LoRA_Linear
-from dora_implementation import Dora_Linear
+from dora_implementation import DoRA_Linear
+from sora_implementation import SoRA_Linear
 
 def replace_linear_with_lora(model, target_modules, lora_type="lora", **kwargs):
     """
@@ -9,8 +10,8 @@ def replace_linear_with_lora(model, target_modules, lora_type="lora", **kwargs):
     """
     lora_module_dict = {
         "lora": LoRA_Linear,
-        # "sora": Sora_Linear,
-        "dora": Dora_Linear
+        "sora": SoRA_Linear,
+        "dora": DoRA_Linear
     }
     lora_cls = lora_module_dict.get(lora_type.lower())
     if lora_cls is None:

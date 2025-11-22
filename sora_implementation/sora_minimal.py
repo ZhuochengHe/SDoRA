@@ -10,7 +10,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 
 
-class SoRALinear(nn.Module):
+class SoRA_Linear(nn.Module):
     """Adds a sparse low-rank branch next to a frozen linear layer."""
 
     def __init__(

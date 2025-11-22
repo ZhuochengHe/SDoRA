@@ -3,7 +3,7 @@ import torch
 from torch.nn import functional as F
 from lora_implementation import LoRA_Linear
     
-class Dora_Linear(LoRA_Linear):
+class DoRA_Linear(LoRA_Linear):
     def __init__(
             self, 
             base_linear,
