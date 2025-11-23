@@ -83,7 +83,7 @@ def summarize_gate_sparsity(model: torch.nn.Module) -> float:
 
 
 def dump_sora_weights(model: torch.nn.Module) -> None:
-    print("\n=== SoRA parameter dump ===")
+    print("\n=== SDoRA parameter dump ===")
     for name, module in model.named_modules():
         if isinstance(module, SDoRA_Linear) and module.gate is not None:
             print(f"Module: {name}")
@@ -220,7 +220,7 @@ while current_xi <= xi_max + 1e-6:
 
 dump_sora_weights(model)
 
-print("\n=== Pruning and Merging SoRA Model ===")
+print("\n=== Pruning and Merging SDoRA Model ===")
 prune_sdora_model(model)
 print("Pruning complete. Merging into base weights...")
 merge_sdora_model(model)
