@@ -22,6 +22,10 @@ class DoRA_Linear(LoRA_Linear):
             lora_dropout=lora_dropout,
         )
         self.weight_m_wdecomp = nn.Linear(1,self.out_features,bias=False)
+        if r > 0:
+            with torch.no_grad():
+                mag = torch.linalg.norm(self.linear.weight.detach(), dim=1, keepdim=True)
+                self.weight_m_wdecomp.weight.copy_(mag)
 
     def forward(self, x):
         previous_dtype = x.dtype
@@ -43,8 +47,8 @@ class DoRA_Linear(LoRA_Linear):
     @torch.no_grad
     def merge(self):
         if self.r > 0 and not self.merged:
-            self._v_norm = torch.linalg.norm(self.linear.weight,dim=1).clone().detach()
             new_weight_v = self.linear.weight + (self.lora_B.weight @ self.lora_A.weight) * self.scaling
+            self._v_norm = torch.linalg.norm(new_weight_v,dim=1).clone().detach()
             norm_scale = self.weight_m_wdecomp.weight.view(-1) / (torch.linalg.norm(new_weight_v,dim=1)).detach()
             self.linear.weight.data = new_weight_v * norm_scale.view(-1,1)
             self.merged = True
