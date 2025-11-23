@@ -96,7 +96,6 @@ def wrap_linears_SDoRA(
 
 
 class SDoRAOptimizer(AdamW):
-    """AdamW variant that applies proximal sparsification to gate parameters."""
 
     def __init__(self, params: Iterable[torch.Tensor], sparse_lambda: float = 0.1, **kwargs) -> None:
         super().__init__(params, **kwargs)
