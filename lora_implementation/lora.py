@@ -20,9 +20,12 @@ class LoRA_Linear(nn.Module):
         self.scaling = lora_alpha / r if r > 0 else 1.0
         self.merged = False
 
+        device = base_linear.weight.device
+        dtype = base_linear.weight.dtype
+
         if r > 0:
-            self.lora_A = nn.Linear(self.in_features, r, bias=False)
-            self.lora_B = nn.Linear(r, self.out_features, bias=False)
+            self.lora_A = nn.Linear(self.in_features, r, bias=False).to(device=device, dtype=dtype)
+            self.lora_B = nn.Linear(r, self.out_features, bias=False).to(device=device, dtype=dtype)
             nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
             nn.init.zeros_(self.lora_B.weight)
 
