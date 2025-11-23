@@ -30,10 +30,12 @@ class SoRA_Linear(LoRA_Linear):
             lora_dropout=lora_dropout,
             **kwargs
         )
-        
+        device = base_linear.weight.device
+        dtype = base_linear.weight.dtype
+
         # Add gate parameter (SoRA-specific)
         if r > 0:
-            self.gate = nn.Parameter(torch.ones(1, r))
+            self.gate = nn.Parameter(torch.ones(1, r, device=device, dtype=dtype))
         else:
             self.register_parameter("gate", None)
 
@@ -84,9 +86,12 @@ class SoRA_Linear(LoRA_Linear):
         new_B_weight = new_B_weight * gate_values.view(1, -1)
 
         # Update parameters (create new nn.Linear modules with correct shapes)
+        device = self.linear.weight.device
+        dtype = self.linear.weight.dtype
+
         self.r = new_rank
-        self.lora_A = nn.Linear(self.in_features, new_rank, bias=False)
-        self.lora_B = nn.Linear(new_rank, self.out_features, bias=False)
+        self.lora_A = nn.Linear(self.in_features, new_rank, bias=False).to(device=device, dtype=dtype)
+        self.lora_B = nn.Linear(new_rank, self.out_features, bias=False).to(device=device, dtype=dtype)
         self.lora_A.weight.data = new_A_weight  # Shape already (new_r, in)
         self.lora_B.weight.data = new_B_weight  # Shape already (out, new_r)
         self.gate = None # Remove gate
