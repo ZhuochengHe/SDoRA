@@ -11,6 +11,8 @@ from sora_implementation.sora import (
     merge_sora_model,
 )
 
+from sd_lora_implementation.sd_lora import SDoRA_Linear
+
 model_name = "roberta-base"
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
@@ -73,7 +75,7 @@ def summarize_gate_sparsity(model: torch.nn.Module) -> float:
     total = 0
     zeros = 0
     for module in model.modules():
-        if isinstance(module, SoRA_Linear) and module.gate is not None:
+        if isinstance(module, SDoRA_Linear) and module.gate is not None:
             gate = module.gate.data
             total += gate.numel()
             zeros += (gate.abs() < eps).sum().item()
@@ -83,7 +85,7 @@ def summarize_gate_sparsity(model: torch.nn.Module) -> float:
 def dump_sora_weights(model: torch.nn.Module) -> None:
     print("\n=== SoRA parameter dump ===")
     for name, module in model.named_modules():
-        if isinstance(module, SoRA_Linear) and module.gate is not None:
+        if isinstance(module, SDoRA_Linear) and module.gate is not None:
             print(f"Module: {name}")
             print("lora_A:\n", module.lora_A.weight.data)
             print("lora_B:\n", module.lora_B.weight.data)
