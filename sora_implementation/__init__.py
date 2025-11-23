@@ -1,1 +1,1 @@
-from .sora import SoRA_Linear
+from .sora import SoRA_Linear, SoRAOptimizer
