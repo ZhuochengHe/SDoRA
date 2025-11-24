@@ -45,7 +45,7 @@ def replace_linear_with_lora(model, target_modules, adapter_name, r=8, lora_alph
     return model
 
 def get_trainable_parameters(model):
-    trainable_parameters = 0
+    trainable_params = 0
     all_param = 0
     for _, param in model.named_parameters():
         all_param += param.numel()
@@ -72,7 +72,7 @@ def get_optimizer(model, adapter_name, lr=1e-4, sparse_lambda=0.3, weight_decay=
         print(f"Found {len(gate_params)} gate parameters, {len(regular_params)} regular parameters")
         
         gate_optimizer = SoRAOptimizer(gate_params, lr=lr * 10, sparse_lambda=sparse_lambda, weight_decay=0.0)
-        base_optimizer = AdamW(regular_params, lr=lr, weight_decay=weight_decay)
+        base_optimizer = AdamW(regular_params, lr=lr, weight_decay=weight_decay, fused=True)
         
         return base_optimizer, gate_optimizer
     

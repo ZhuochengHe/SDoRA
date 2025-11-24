@@ -211,3 +211,5 @@ test.*
 test_*
 
 out*
+
+*.log

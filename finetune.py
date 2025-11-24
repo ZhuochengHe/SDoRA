@@ -89,8 +89,8 @@ def train(
     lora_alpha: int = 16,
     lora_dropout: float = 0.05,
     target_modules: list = None,
-    batch_size: int = 32,
-    micro_batch_size: int = 2,
+    batch_size: int = 16,
+    micro_batch_size: int = 16,
     num_epochs: int = 3,
     learning_rate: float = 1e-5,
     sparse_lambda: float = 0.3,
@@ -120,6 +120,10 @@ def train(
         device_map="auto",
         trust_remote_code=True,
     )
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
 
     # Apply adapter
     model = replace_linear_with_lora(
@@ -144,14 +148,43 @@ def train(
     val_data = data["test"]
 
     # Tokenize
-    def generate_and_tokenize_prompt(data_point):
-        return tokenize(generate_prompt(data_point), tokenizer, cutoff_len)
+    # def generate_and_tokenize_prompt(data_point):
+    #     return tokenize(generate_prompt(data_point), tokenizer, cutoff_len)
+    def generate_and_tokenize_prompt(batch):
+        prompts = [
+            generate_prompt({
+                "instruction": instr,
+                "input": inp,
+                "output": out
+            })
+            for instr, inp, out in zip(
+                batch["instruction"],
+                batch.get("input", [None]*len(batch["instruction"])),
+                batch["output"],
+            )
+        ]
+        tokens = tokenizer(
+            prompts,
+            truncation=True,
+            max_length=256,
+        )
 
-    train_data = train_data.map(generate_and_tokenize_prompt, remove_columns=train_data.column_names)
-    val_data = val_data.map(generate_and_tokenize_prompt, remove_columns=val_data.column_names)
+        tokens["labels"] = tokens["input_ids"].copy()
+        return tokens
+
+    train_data = train_data.map(generate_and_tokenize_prompt, remove_columns=train_data.column_names, batched=True, num_proc=4)
+    val_data = val_data.map(generate_and_tokenize_prompt, remove_columns=val_data.column_names, batched=True, num_proc=2)
 
     # Dataloader
     def collate_fn(batch):
+        for i, x in enumerate(batch):
+            if "input_ids" not in x:
+                print(f"[collate] Missing input_ids in sample {i}: keys={list(x.keys())}")
+            else:
+                if not isinstance(x["input_ids"], (list, tuple)):
+                    print(f"[collate] BAD input_ids type in sample {i}: {type(x['input_ids'])} -> value={x['input_ids']}")
+                    print("Full sample:", x)
+                    raise TypeError(f"Bad input_ids type at sample {i}: {type(x['input_ids'])}")
         max_len = max(len(x["input_ids"]) for x in batch)
         input_ids = [x["input_ids"] + [0]*(max_len-len(x["input_ids"])) for x in batch]
         attention_mask = [x["attention_mask"] + [0]*(max_len-len(x["attention_mask"])) for x in batch]
@@ -162,8 +195,8 @@ def train(
             "labels": torch.tensor(labels)
         }
 
-    train_loader = DataLoader(train_data, batch_size=micro_batch_size, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_data, batch_size=micro_batch_size, collate_fn=collate_fn)
+    train_loader = DataLoader(train_data, batch_size=micro_batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2)
+    val_loader = DataLoader(val_data, batch_size=micro_batch_size, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True, prefetch_factor=2)
 
     # Optimizer
     base_opt, gate_opt = get_optimizer(model, adapter_name, lr=learning_rate, sparse_lambda=sparse_lambda)
@@ -194,11 +227,13 @@ def train(
         
         for step, batch in enumerate(pbar):
             batch = {k: v.to(model.device) for k, v in batch.items()}
-            outputs = model(**batch)
-            loss = outputs.loss / gradient_accumulation_steps
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                outputs = model(**batch)
+                loss = outputs.loss / gradient_accumulation_steps
             loss.backward()
 
             if (step + 1) % gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 base_opt.step()
                 if gate_opt: gate_opt.step()
                 
@@ -220,7 +255,8 @@ def train(
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validating", leave=False):
                 batch = {k: v.to(model.device) for k, v in batch.items()}
-                outputs = model(**batch)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    outputs = model(**batch)
                 val_loss += outputs.loss.item()
         val_loss /= len(val_loader)
         model.train()

@@ -1,9 +1,9 @@
 #!/bin/bash
 
 ADAPTER=$1
-GPU=$2
-R=${3:-8}
-ALPHA=${4:-16}
+R=${2:-8}
+ALPHA=${3:-16}
+GPU=$4
 
 OUTPUT_DIR="outputs/${ADAPTER}_r${R}"
 
@@ -17,6 +17,6 @@ CUDA_VISIBLE_DEVICES=$GPU python finetune.py \
     --adapter_name $ADAPTER \
     --lora_r $R \
     --lora_alpha $ALPHA \
-    --num_epochs 15 \
+    --num_epochs 3 \
     --learning_rate 1e-4 \
     --sparse_lambda 0.3
