@@ -2,21 +2,58 @@ import os
 import json
 import time
 import torch
+import csv
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 from datasets import load_dataset
 from utils import replace_linear_with_lora, get_optimizer, merge_and_save 
 from tqdm import tqdm
 import argparse
-from accelerate import Accelerator # <-- 新增
+from accelerate import Accelerator
 
 class MetricsTracker:
     def __init__(self, output_dir):
         self.output_dir = output_dir
         self.history = {
             'train_loss': [], 'val_loss': [],
-            'epoch_time': [], 'sparsity': []
+            'epoch_time': [], 'sparsity': [],
+            'gpu_memory_mb': [], 'effective_params': []
         }
+        # CSV file to record loss every k steps
+        self.csv_path = os.path.join(output_dir, 'loss_log.csv')
+        with open(self.csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['epoch', 'step', 'train_loss', 'learning_rate', 'gpu_memory_mb', 'sparsity'])
+        
+        # CSV file for detailed sparsity tracking (SoRA/SDoRA only)
+        self.sparsity_csv_path = os.path.join(output_dir, f'sparsity_log.csv')
+        self.sparsity_initialized = False
+    
+    def log_step(self, epoch, step, loss, lr, gpu_memory, sparsity=None):
+        """Log loss to CSV every k steps"""
+        with open(self.csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            sparsity_str = f'{sparsity:.6f}' if sparsity is not None else 'N/A'
+            writer.writerow([epoch, step, f'{loss:.6f}', f'{lr:.6e}', f'{gpu_memory:.2f}', sparsity_str])
+    
+    def log_sparsity_details(self, epoch, step, layer_sparsity_dict):
+        """Log per-layer sparsity details for SoRA/SDoRA"""
+        if not self.sparsity_initialized:
+            # Initialize CSV with layer names as headers
+            with open(self.sparsity_csv_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                headers = ['epoch', 'step', 'overall_sparsity'] + sorted(layer_sparsity_dict.keys())
+                writer.writerow(headers)
+            self.sparsity_initialized = True
+        
+        # Write sparsity data
+        with open(self.sparsity_csv_path, 'a', newline='') as f:
+            writer = csv.writer(f)
+            overall_sparsity = sum(layer_sparsity_dict.values()) / len(layer_sparsity_dict) if layer_sparsity_dict else 0.0
+            row = [epoch, step, f'{overall_sparsity:.6f}']
+            for layer_name in sorted(layer_sparsity_dict.keys()):
+                row.append(f'{layer_sparsity_dict[layer_name]:.6f}')
+            writer.writerow(row)
     
     def update(self, metrics):
         for k, v in metrics.items():
@@ -33,20 +70,68 @@ class MetricsTracker:
         for k, v in metrics.items():
             if isinstance(v, float):
                 print(f"  {k:20s}: {v:.4f}")
+            elif isinstance(v, int):
+                print(f"  {k:20s}: {v:,}")
         print(f"{'='*70}\n")
 
 
-def get_sparsity_stats(model):
+def get_gpu_memory():
+    """Get current GPU memory usage (MB)"""
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / 1024 / 1024
+    return 0.0
+
+def get_sparsity_stats(model, detailed=False):
+    """Calculate sparsity statistics
+    
+    Args:
+        model: The model to analyze
+        detailed: If True, return per-layer sparsity dict; if False, return overall sparsity float
+    
+    Returns:
+        float or dict: Overall sparsity or per-layer sparsity dictionary
+    """
     total_gates = 0
     zero_gates = 0
+    layer_stats = {}
     
-    for module in model.modules():
+    for name, module in model.named_modules():
         if hasattr(module, 'gate') and module.gate is not None:
             gate = module.gate
-            total_gates += gate.numel()
-            zero_gates += (gate.abs() < 1e-6).sum().item()
+            layer_total = gate.numel()
+            layer_zeros = (gate.abs() < 1e-6).sum().item()
+            
+            total_gates += layer_total
+            zero_gates += layer_zeros
+            
+            if detailed:
+                layer_sparsity = layer_zeros / layer_total if layer_total > 0 else 0.0
+                # Simplify layer name for readability
+                simple_name = name.replace('base_model.model.', '').replace('.base_layer', '')
+                layer_stats[simple_name] = layer_sparsity
     
-    return zero_gates / total_gates if total_gates > 0 else 0.0
+    if detailed:
+        return layer_stats
+    else:
+        return zero_gates / total_gates if total_gates > 0 else 0.0
+
+def compute_effective_params(model, adapter_config):
+    """Calculate effective parameter count (accounting for sparsity)"""
+    trainable_params = 0
+    effective_params = 0
+    
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            param_count = param.numel()
+            trainable_params += param_count
+            
+            # For SoRA/SDoRA, only non-zero elements in gate parameters count as effective
+            if adapter_config['adapter_name'].lower() in ['sora', 'sdora'] and 'gate' in name:
+                effective_params += (param.abs() >= 1e-6).sum().item()
+            else:
+                effective_params += param_count
+    
+    return trainable_params, effective_params
 
 
 def generate_prompt(data_point):
@@ -138,14 +223,14 @@ def train(
 
     gradient_accumulation_steps = batch_size // micro_batch_size
 
-    # 1. 初始化 Accelerator
+    # 1. Initialize Accelerator
     accelerator = Accelerator(
         mixed_precision="bf16",
         gradient_accumulation_steps=gradient_accumulation_steps,
     )
     device = accelerator.device
     
-    # 确保只有主进程进行文件系统操作
+    # Ensure only main process performs file system operations
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
         print(f"\n{'='*70}")
@@ -163,7 +248,7 @@ def train(
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
 
-    # 移除 device_map="auto"，由 Accelerator 管理设备
+    # Remove device_map="auto", let Accelerator manage devices
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
         torch_dtype=torch.bfloat16,
@@ -179,8 +264,17 @@ def train(
         model, target_modules, adapter_name, 
         r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout
     )
+    
+    # Save adapter config for later calculations
+    adapter_config = {
+        'adapter_name': adapter_name,
+        'r': lora_r,
+        'alpha': lora_alpha,
+        'dropout': lora_dropout,
+        'target_modules': target_modules
+    }
 
-    # Count parameters (仅在主进程打印)
+    # Count parameters (only print on main process)
     if accelerator.is_main_process:
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
@@ -214,7 +308,7 @@ def train(
     if gate_opt:
         gate_scheduler = get_linear_schedule_with_warmup(gate_opt, num_warmup_steps=20, num_training_steps=num_steps)
 
-    # 2. 使用 Accelerator.prepare 统一管理
+    # 2. Use Accelerator.prepare for unified management
     model, base_opt, train_loader, val_loader, scheduler = accelerator.prepare(
         model, base_opt, train_loader, val_loader, scheduler
     )
@@ -232,29 +326,28 @@ def train(
     
     model.train()
     
+    # Add checkpoint save configuration
+    save_steps = 3000  # Save checkpoint every 500 steps
+    log_steps = 100   # Log to CSV every 100 steps
+    
     for epoch in range(num_epochs):
         epoch_start = time.time()
         total_loss = 0
         
-        # 禁用非主进程的 tqdm
+        # Disable tqdm for non-main processes
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", disable=not accelerator.is_local_main_process)
         
         for step, batch in enumerate(pbar):
-            # 3. 移除手动 to(device) 和 autocast
-            # 将数据移动到设备 (保留，以防万一，但prepare通常已处理)
             batch = {k: v.to(device) for k, v in batch.items()}
             
-            # 使用 accelerator.accumulate 自动处理梯度累积
+            # Use accelerator.accumulate for automatic gradient accumulation
             with accelerator.accumulate(model):
-                # 移除 with torch.autocast(...)
                 outputs = model(**batch)
                 loss = outputs.loss
                 
-                # 4. 使用 accelerator.backward() 自动处理混合精度和梯度累积
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients:
-                    # 在优化器执行前，使用 accelerator 包装的裁剪
                     accelerator.clip_grad_norm_(model.parameters(), 1.0)
                     
                     base_opt.step()
@@ -266,13 +359,38 @@ def train(
                     base_opt.zero_grad()
                     if gate_opt: gate_opt.zero_grad()
 
-            # 在这里，loss 已经是平均到 micro_batch_size 的损失
             total_loss += loss.item()
 
-            # 更新进度条 (只有在主进程)
+            # Update progress bar and log GPU memory
             if accelerator.is_main_process:
                 current_loss = total_loss / (step + 1)
-                pbar.set_postfix({'loss': f'{current_loss:.4f}', 'lr': f'{scheduler.get_last_lr()[0]:.2e}'})
+                current_lr = scheduler.get_last_lr()[0]
+                gpu_mem = get_gpu_memory()
+                
+                # Calculate sparsity for SoRA/SDoRA
+                current_sparsity = None
+                if adapter_config['adapter_name'].lower() in ['sora', 'sdora']:
+                    current_sparsity = get_sparsity_stats(model, detailed=False)
+                    pbar.set_postfix({'loss': f'{current_loss:.4f}', 'lr': f'{current_lr:.2e}', 'gpu_mb': f'{gpu_mem:.0f}', 'sparsity': f'{current_sparsity:.3f}'})
+                else:
+                    pbar.set_postfix({'loss': f'{current_loss:.4f}', 'lr': f'{current_lr:.2e}', 'gpu_mb': f'{gpu_mem:.0f}'})
+                
+                # Log to CSV every log_steps
+                if (step + 1) % log_steps == 0:
+                    tracker.log_step(epoch + 1, step + 1, current_loss, current_lr, gpu_mem, current_sparsity)
+                    
+                    # Log detailed per-layer sparsity for SoRA/SDoRA
+                    if adapter_config['adapter_name'].lower() in ['sora', 'sdora']:
+                        layer_sparsity = get_sparsity_stats(model, detailed=True)
+                        tracker.log_sparsity_details(epoch + 1, step + 1, layer_sparsity)
+                
+                # Save checkpoint every save_steps
+                if (step + 1) % save_steps == 0:
+                    ckpt_dir = os.path.join(output_dir, f"checkpoint-epoch{epoch+1}-step{step+1}")
+                    os.makedirs(ckpt_dir, exist_ok=True)
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    torch.save(unwrapped_model.state_dict(), os.path.join(ckpt_dir, "model.pt"))
+                    print(f"\n✓ Checkpoint saved to: {ckpt_dir}")
 
         # Validation
         model.eval()
@@ -280,68 +398,90 @@ def train(
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validating", leave=False, disable=not accelerator.is_local_main_process):
                 batch = {k: v.to(device) for k, v in batch.items()}
-                # 在验证时仍保留 autocast，确保 bfloat16 计算
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16): 
                     outputs = model(**batch)
                 val_loss += outputs.loss.item()
         
-        # 聚合验证损失（多卡时需要）
-        # 单卡模式下，这仍是 val_loss，但如果未来扩展，这会确保正确平均
+        # Aggregate validation loss (needed for multi-GPU)
         val_loss = accelerator.reduce(torch.tensor(val_loss).to(device), reduction="mean").item()
-        
         val_loss /= len(val_loader)
         model.train()
 
-        # Collect metrics (仅主进程)
+        # Collect metrics (main process only)
         if accelerator.is_main_process:
             epoch_time = time.time() - epoch_start
+            avg_train_loss = total_loss / len(train_loader)
+            
+            # Calculate parameter statistics
+            trainable_params, effective_params = compute_effective_params(model, adapter_config)
+            gpu_mem = get_gpu_memory()
+            
             metrics = {
-                # total_loss 现在是在整个训练集上平均的 loss
-                'train_loss': total_loss / len(train_loader), 
+                'epoch': epoch + 1,
+                'train_loss': avg_train_loss, 
                 'val_loss': val_loss,
-                'epoch_time': epoch_time
+                'epoch_time': epoch_time,
+                'gpu_memory_mb': gpu_mem,
+                'trainable_params': trainable_params,
+                'effective_params': effective_params
             }
             
             # Add sparsity for SoRA/SDoRA
             if adapter_name.lower() in ['sora', 'sdora']:
-                # 在主进程上计算稀疏度
                 metrics['sparsity'] = get_sparsity_stats(model)
             
-            # Update and print
+            # Update and log to JSON
             tracker.update(metrics)
             tracker.print_summary(epoch + 1, metrics)
             
-        accelerator.wait_for_everyone() # 等待所有进程完成该 epoch
+            # Save checkpoint at the end of each epoch
+            epoch_ckpt_dir = os.path.join(output_dir, f"checkpoint-epoch{epoch+1}")
+            os.makedirs(epoch_ckpt_dir, exist_ok=True)
+            unwrapped_model = accelerator.unwrap_model(model)
+            torch.save(unwrapped_model.state_dict(), os.path.join(epoch_ckpt_dir, "model.pt"))
+            print(f"✓ Epoch checkpoint saved to: {epoch_ckpt_dir}")
+            
+        accelerator.wait_for_everyone()  # Wait for all processes to complete this epoch
 
-    # Final Save (仅主进程)
+    # Final Save (main process only)
     if accelerator.is_main_process:
         print(f"\n{'='*70}")
         print("Training Complete!")
         print(f"{'='*70}\n")
         
-        # 5. 解包模型并保存
+        # Unwrap model and save
         unwrapped_model = accelerator.unwrap_model(model)
         
         save_path = os.path.join(output_dir, "model.pt")
         merge_and_save(unwrapped_model, adapter_name, save_path)
         tokenizer.save_pretrained(output_dir)
         
+        # Save training logs
+        tracker.save_to_json(os.path.join(output_dir, "training_log.json"))
+        
         print(f"✓ Model saved to: {save_path}")
-        print(f"✓ History saved to: {os.path.join(output_dir, 'training_history.json')}\n")
+        print(f"✓ Training log (JSON) saved to: {os.path.join(output_dir, 'training_log.json')}")
+        print(f"✓ Loss log (CSV) saved to: {tracker.csv_path}")
+        print(f"\n📊 Training Summary:")
+        print(f"  Total Epochs: {num_epochs}")
+        print(f"  Adapter: {adapter_name}")
+        print(f"  LoRA r: {adapter_config.get('r', 'N/A')}")
+        print(f"  Learning Rate: {learning_rate}")
+        print(f"  Output Directory: {output_dir}")
+        print(f"{'='*70}\n")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base_model", default="meta-llama/Meta-Llama-3-8B")
+    parser.add_argument("--base_model", default="Qwen/Qwen2.5-3B")
     parser.add_argument("--data_path", default="/home/ubuntu/LLM-inference/liangzhao-project/yunqi/DoRA-SoRA-and-LoRA/adapters/dora/commonsense_reasoning/commonsense_170k.json")
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--adapter_name", default="lora", choices=["lora", "sora", "dora", "sdora"])
-    parser.add_argument("--lora_r", type=int, default=8)
-    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--num_epochs", type=int, default=3)
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--sparse_lambda", type=float, default=0.3)
-    # 新增参数，便于控制，如果不需要可以删除
     parser.add_argument("--micro_batch_size", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=32)
 
