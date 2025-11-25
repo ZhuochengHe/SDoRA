@@ -31,7 +31,7 @@ else
 fi
 
 echo "========================================"
-echo "Training ${ADAPTER^^} on Qwen2.5-4B"
+echo "Training ${ADAPTER^^} on Qwen2.5-3B"
 echo "========================================"
 echo "Rank: ${R}, Alpha: ${ALPHA}"
 echo "Learning Rate: ${LR}"
@@ -51,7 +51,7 @@ CUDA_VISIBLE_DEVICES=$GPU accelerate launch finetune_accelerate.py \
     --num_epochs 3 \
     --learning_rate $LR \
     --sparse_lambda $SPARSE_LAMBDA \
-    --micro_batch_size 8 \
+    --micro_batch_size 32 \
     --batch_size 32
 
 echo "========================================"
