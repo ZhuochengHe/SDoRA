@@ -456,9 +456,6 @@ def train(
         merge_and_save(unwrapped_model, adapter_name, save_path)
         tokenizer.save_pretrained(output_dir)
         
-        # Save training logs
-        tracker.save_to_json(os.path.join(output_dir, "training_log.json"))
-        
         print(f"✓ Model saved to: {save_path}")
         print(f"✓ Training log (JSON) saved to: {os.path.join(output_dir, 'training_log.json')}")
         print(f"✓ Loss log (CSV) saved to: {tracker.csv_path}")

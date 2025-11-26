@@ -97,6 +97,7 @@ def merge_and_save(model, adapter_name, save_path):
     
     adapter_cls = adapter_classes.get(adapter_name.lower())
     
+    r_details = {}
     # 1. prune（SoRA/SDoRA）
     if adapter_name.lower() in ["sora", "sdora"]:
         print("Pruning sparse gates...")
@@ -104,17 +105,27 @@ def merge_and_save(model, adapter_name, save_path):
         total_ranks_before = 0
         total_ranks_after = 0
         
-        for module in model.modules():
+        for name, module in model.named_modules():
             if isinstance(module, adapter_cls) and hasattr(module, 'prune'):
                 if hasattr(module, 'r') and hasattr(module, 'gate') and module.gate is not None:
                     total_ranks_before += module.r
                     module.prune()
                     total_ranks_after += module.r
                     pruned_count += 1
+                    r_details[name] = module.r
         
         if total_ranks_before > 0:
             compression = 100 * (1 - total_ranks_after / total_ranks_before)
             print(f"Pruned {pruned_count} modules: {total_ranks_before} -> {total_ranks_after} ranks ({compression:.1f}% reduction)")
+
+    if adapter_name.lower() in ["lora", "dora"]:
+        for name, module in model.named_modules():
+            if isinstance(module, adapter_cls) and hasattr(module, 'r'):
+                r_details[name] = module.r
+    r_json_path = save_path + "_r_details.json"
+    with open(r_json_path, "w") as f:
+        json.dump(r_details, f, indent=2)
+    print(f"Saved r details to {r_json_path}")
     
     # 2. Merge to base weights
     print(f"Merging {adapter_name.upper()} weights...")
