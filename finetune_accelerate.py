@@ -254,6 +254,10 @@ def train(
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
+   
+    for p in model.parameters():
+        p.requires_grad_(False)
+    
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = False
     model.gradient_checkpointing_enable()
@@ -273,12 +277,36 @@ def train(
         'dropout': lora_dropout,
         'target_modules': target_modules
     }
-
-    # Count parameters (only print on main process)
+    # ===== DEBUG: check which params are trainable =====
     if accelerator.is_main_process:
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in model.parameters())
-        print(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)\n")
+        total_params = 0
+        trainable_params = 0
+        trainable_names = []
+        frozen_names = []
+
+        for name, p in model.named_parameters():
+            num = p.numel()
+            total_params += num
+            if p.requires_grad:
+                trainable_params += num
+                trainable_names.append(name)
+            else:
+                frozen_names.append(name)
+
+        ratio = 100.0 * trainable_params / total_params
+
+        print("\n[DEBUG] Parameter freezing status AFTER LoRA injection")
+        print(f"  Total parameters   : {total_params:,}")
+        print(f"  Trainable params   : {trainable_params:,} ({ratio:.2f}%)")
+        print("  Sample trainable parameters (first 30):")
+        for n in trainable_names[:30]:
+            print("    [T] ", n)
+        print("  Sample frozen parameters (first 30):")
+        for n in frozen_names[:30]:
+            print("    [F] ", n)
+        print("  NOTE: for a 'pure' LoRA setup, almost all trainable names")
+        print("        should be lora_A / lora_B / gate rather than base weights.\n")
+    # ===== END DEBUG =====
 
     # Load dataset
     if data_path.endswith(".json"):

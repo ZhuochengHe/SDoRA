@@ -8,7 +8,7 @@ from sd_lora_implementation import SDoRA_Linear
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.optim import AdamW
 
-def replace_linear_with_lora(model, target_modules, adapter_name, r=8, lora_alpha=16.0, lora_dropout=0.05):
+def replace_linear_with_lora(model, target_modules, adapter_name, r=8, lora_alpha=16.0, lora_dropout=0.05, init_as_merged: bool = False):
     """
 	Iterate through the model and change all the target modules into lora
     """
@@ -30,10 +30,15 @@ def replace_linear_with_lora(model, target_modules, adapter_name, r=8, lora_alph
             parent_name = ".".join(name.split(".")[:-1])
             child_name = name.split(".")[-1]
             parent = model.get_submodule(parent_name) if parent_name else model
+
+            if init_as_merged and adapter_name.lower() in ["sora", "sdora"]:
+                eff_r = 0
+            else:
+                eff_r = r
             
             adapter_module = adapter_cls(
                 base_linear=module,
-                r=r,
+                r=eff_r,
                 lora_alpha=lora_alpha,
                 lora_dropout=lora_dropout
             )
