@@ -6,7 +6,7 @@ import csv
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 from datasets import load_dataset
-from utils import replace_linear_with_lora, get_optimizer, merge_and_save 
+from utils import replace_linear_with_lora, get_optimizer, merge_and_save, log_gate_stats
 from tqdm import tqdm
 import argparse
 from accelerate import Accelerator
@@ -378,7 +378,8 @@ def train(
                 # Log to CSV every log_steps
                 if (step + 1) % log_steps == 0:
                     tracker.log_step(epoch + 1, step + 1, current_loss, current_lr, gpu_mem, current_sparsity)
-                    
+
+                    log_gate_stats(model)
                     # Log detailed per-layer sparsity for SoRA/SDoRA
                     if adapter_config['adapter_name'].lower() in ['sora', 'sdora']:
                         layer_sparsity = get_sparsity_stats(model, detailed=True)

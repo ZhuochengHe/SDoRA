@@ -141,3 +141,14 @@ def merge_and_save(model, adapter_name, save_path):
     torch.save(model.state_dict(), save_path)
     print(f"Saved to {save_path}")
 
+def log_gate_stats(model):
+    gate_vals = []
+    for name, module in model.named_modules():
+        if hasattr(module, 'gate') and module.gate is not None:
+            g = module.gate.detach().float().flatten()
+            gate_vals.append(g)
+    if not gate_vals:
+        print("No gates found.")
+        return
+    allg = torch.cat(gate_vals)
+    print(f"Gate stats: mean={allg.mean():.6f}, std={allg.std():.6f}, min={allg.min():.6f}, max={allg.max():.6f}, exact_zero={int((allg==0).sum().item())}/{allg.numel()}")
