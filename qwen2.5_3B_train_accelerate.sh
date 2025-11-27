@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Usage: ./qwen2.5_4B_train_accelerate.sh [ADAPTER] [R] [ALPHA] [GPU_ID] [SPARSE_LAMBDA]
-# Example: ./qwen2.5_4B_train_accelerate.sh dora 16 32 0 0.3
+# Usage: ./qwen2.5_3B_train_accelerate.sh [ADAPTER] [R] [ALPHA] [GPU_ID] [SPARSE_LAMBDA]
+# Example: ./qwen2.5_3B_train_accelerate.sh dora 16 32 0 0.3
 
 ADAPTER=$1
 R=${2:-16}
