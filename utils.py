@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import json
+from typing import Optional
 from lora_implementation import LoRA_Linear
 from dora_implementation import DoRA_Linear
 from sora_implementation import SoRA_Linear, SoRAOptimizer
@@ -58,7 +59,7 @@ def get_trainable_parameters(model):
             trainable_params += param.numel()
     return trainable_params, all_param
 
-def get_optimizer(model, adapter_name, lr=1e-4, sparse_lambda=0.3, weight_decay=0.01):
+def get_optimizer(model, adapter_name, lr=1e-4, sparse_lambda=0.3, weight_decay=0.01, gate_lr_multiplier=10, gate_lr: Optional[float] = None):
     adapter_name = adapter_name.lower()
     
     if adapter_name in ["sora", "sdora"]:        
@@ -76,7 +77,12 @@ def get_optimizer(model, adapter_name, lr=1e-4, sparse_lambda=0.3, weight_decay=
         
         print(f"Found {len(gate_params)} gate parameters, {len(regular_params)} regular parameters")
         
-        gate_optimizer = SoRAOptimizer(gate_params, lr=lr * 10, sparse_lambda=sparse_lambda, weight_decay=0.0)
+        # if gate_lr explicit is provided, use that (absolute), otherwise use lr * gate_lr_multiplier
+        if gate_lr is None:
+            gate_lr_val = lr * gate_lr_multiplier
+        else:
+            gate_lr_val = gate_lr
+        gate_optimizer = SoRAOptimizer(gate_params, lr=gate_lr_val, sparse_lambda=sparse_lambda, weight_decay=0.0)
         base_optimizer = AdamW(regular_params, lr=lr, weight_decay=weight_decay, fused=True)
         
         return base_optimizer, gate_optimizer
@@ -142,7 +148,7 @@ def merge_and_save(model, adapter_name, save_path):
     
     print(f"Merged {merged_count} modules")
     
-    # 3. 保存
+    # 3. Save
     torch.save(model.state_dict(), save_path)
     print(f"Saved to {save_path}")
 
@@ -157,3 +163,28 @@ def log_gate_stats(model):
         return
     allg = torch.cat(gate_vals)
     print(f"Gate stats: mean={allg.mean():.6f}, std={allg.std():.6f}, min={allg.min():.6f}, max={allg.max():.6f}, exact_zero={int((allg==0).sum().item())}/{allg.numel()}")
+
+
+def get_sora_delta_stats(model):
+    """Return a quick approximation of per-SoRA-layer delta vs base weight scales.
+    The estimate is max(|A|) * max(|B|) * max(|gate|) and a ratio vs base weight max as a quick diagnostic.
+    """
+    res = []
+    for name, module in model.named_modules():
+        if isinstance(module, SoRA_Linear):
+            a_max = module.A.data.abs().max().item() if hasattr(module, 'A') and module.A is not None else 0.0
+            b_max = module.B.data.abs().max().item() if hasattr(module, 'B') and module.B is not None else 0.0
+            gate_max = module.gate.data.abs().max().item() if hasattr(module, 'gate') and module.gate is not None else 0.0
+            base_w_max = module.weight.data.abs().max().item() if hasattr(module, 'weight') and module.weight is not None else 0.0
+            est_delta_max = a_max * b_max * gate_max
+            ratio = est_delta_max / (base_w_max + 1e-12)
+            res.append({
+                'name': name,
+                'a_max': a_max,
+                'b_max': b_max,
+                'gate_max': gate_max,
+                'base_w_max': base_w_max,
+                'est_delta_max': est_delta_max,
+                'ratio': ratio
+            })
+    return res
