@@ -16,20 +16,22 @@ if [ -z "$ADAPTER" ] || [ -z "$GPU" ]; then
     exit 1
 fi
 
-# Set output directory with sparsity suffix for SoRA/SDoRA experiments
-if [ "$ADAPTER" = "sora" ] || [ "$ADAPTER" = "sdora" ]; then
-    OUTPUT_DIR="outputs/Qwen2.5-3B_${ADAPTER}_r${R}_lambda${SPARSE_LAMBDA}"
-else
-    OUTPUT_DIR="outputs/Qwen2.5-3B_${ADAPTER}_r${R}"
-fi
 
 # Set learning rate based on adapter type
 if [ "$ADAPTER" = "lora" ]; then
     LR=3e-4
-elif [ "$ADAPTER" = "sora" ]; then
+elif [[ "$ADAPTER" = "sdora" || "$ADAPTER" = "sora" ]]; then
     LR=6e-4
+    SPARSE_LAMBDA=0.1
 else
-    LR=1e-4
+    LR=2e-4
+fi
+
+# Set output directory with sparsity suffix for SoRA/SDoRA experiments
+if [ "$ADAPTER" = "sora" ] || [ "$ADAPTER" = "sdora" ]; then
+    OUTPUT_DIR="outputs/Qwen2.5-3B_${ADAPTER}_r${R}_lambda${SPARSE_LAMBDA}_lr${LR}_alpha${ALPHA}"
+else
+    OUTPUT_DIR="outputs/Qwen2.5-3B_${ADAPTER}_r${R}_lr${LR}_alpha${ALPHA}"
 fi
 
 echo "========================================"

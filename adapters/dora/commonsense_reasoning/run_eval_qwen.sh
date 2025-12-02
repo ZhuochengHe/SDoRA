@@ -10,11 +10,17 @@
 #   # LoRA, custom checkpoint and batch size
 #   ./run_eval_qwen.sh Qwen2.5-3B_lora_r16 lora 16 32 checkpoint-epoch2/model.pt 8
 #
+#   # DoRA, use default r=16, alpha=32, model.pt, bs=16, dropout=0.05
+#   ./run_eval_qwen.sh Qwen2.5-3B_dora_r16 dora
+#
 #   # SoRA, custom sparsity setup (r/alpha usually same as training)
-#   ./run_eval_qwen.sh Qwen2.5-3B_sora_r16_lambda0.3 sora 16 32 model.pt 16 Qwen/Qwen2.5-3B 0.05
+#   ./run_eval_qwen.sh Qwen2.5-3B_sora_r16_lambda0.1 sora 16 32 model.pt 16 Qwen/Qwen2.5-3B 0.05
+#
+#   # SdoRA
+#   ./run_eval_qwen.sh Qwen2.5-3B_sdora_r16_lambda0.1 sdora 16 32 model.pt 16 Qwen/Qwen2.5-3B 0.05
 
-# MODEL_TAG is the folder name under ../../../test_outputs/
-# e.g. ../../../test_outputs/Qwen2.5-3B_lora_r16
+# MODEL_TAG is the folder name under ../../../outputs/
+# e.g. ../../../outputs/Qwen2.5-3B_lora_r16
 MODEL_TAG=$1
 ADAPTER_NAME=$2                    # lora / sora / dora / sdora
 R=${3:-16}                         # LoRA rank (default: 16)
@@ -30,7 +36,7 @@ if [ -z "$MODEL_TAG" ] || [ -z "$ADAPTER_NAME" ]; then
     exit 1
 fi
 
-MODEL_DIR="../../../test_outputs/${MODEL_TAG}"
+MODEL_DIR="../../../outputs/${MODEL_TAG}"
 
 if [ ! -d "$MODEL_DIR" ]; then
     echo "Error: directory ${MODEL_DIR} does not exist."
