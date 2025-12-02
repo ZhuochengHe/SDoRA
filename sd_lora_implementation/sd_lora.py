@@ -36,10 +36,9 @@ class SDoRA_Linear(SoRA_Linear):
                 self.weight_m_wdecomp.weight.copy_(mag)
 
     def forward(self, x):
+        device = self.linear.weight.device
+        dtype = self.linear.weight.dtype
         if self.r > 0 and not self.merged:
-            device = self.linear.weight.device
-            dtype = self.linear.weight.dtype
-
             new_weight_v = self.linear.weight + (self.lora_B.weight.mul(self.gate) @ self.lora_A.weight)* self.scaling
             # v_norm = torch.linalg.norm(new_weight_v,dim=1) + 1e-6
             eps = 1e-6
