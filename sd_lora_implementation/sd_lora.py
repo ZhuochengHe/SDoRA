@@ -58,7 +58,7 @@ class SDoRA_Linear(SoRA_Linear):
         
         return result
     
-    @torch.no_grad
+    @torch.no_grad()
     def merge(self):
         if self.r > 0 and not self.merged:
             device = self.linear.weight.device
@@ -73,7 +73,7 @@ class SDoRA_Linear(SoRA_Linear):
             self.linear.weight.data = new_weight_v * norm_scale.view(-1,1).to(dtype)
             self.merged = True
     
-    @torch.no_grad
+    @torch.no_grad()
     def unmerge(self):
         if self.r > 0 and self.merged:
             if hasattr(self, "_v_norm"):

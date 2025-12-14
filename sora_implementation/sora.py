@@ -57,7 +57,7 @@ class SoRA_Linear(LoRA_Linear):
             
         return result + delta * self.scaling
 
-    @torch.no_grad
+    @torch.no_grad()
     def prune(self) -> None:
         """Prune zeroed-out ranks and merge gate into weights."""
         if self.gate is None or self.r == 0:
@@ -96,7 +96,7 @@ class SoRA_Linear(LoRA_Linear):
         self.lora_B.weight.data = new_B_weight  # Shape already (out, new_r)
         self.gate = None # Remove gate
 
-    @torch.no_grad
+    @torch.no_grad()
     def merge(self) -> None:
         """Merge the LoRA branch into the base layer weights for maximum inference speed."""
         if self.r == 0 or self.lora_A is None or self.merged:
@@ -119,7 +119,7 @@ class SoRA_Linear(LoRA_Linear):
         self.linear.weight.data += weight_delta.to(self.linear.weight.device)
         self.merged = True
 
-    @torch.no_grad
+    @torch.no_grad()
     def unmerge(self) -> None:
         """Unmerge the LoRA branch from the base layer weights."""
         if self.r == 0 or self.lora_A is None or not self.merged:

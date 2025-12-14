@@ -45,13 +45,13 @@ class LoRA_Linear(nn.Module):
         else:
             return self.linear(x)
 
-    @torch.no_grad
+    @torch.no_grad()
     def merge(self):
         if self.r > 0 and not self.merged:
             self.linear.weight.data += (self.lora_B.weight @ self.lora_A.weight) * self.scaling
             self.merged = True
 
-    @torch.no_grad
+    @torch.no_grad()
     def unmerge(self):
         if self.r > 0 and self.merged:
             self.linear.weight.data -= (self.lora_B.weight @ self.lora_A.weight) * self.scaling
