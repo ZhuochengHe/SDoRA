@@ -18,6 +18,11 @@
 #
 #   # SdoRA
 #   ./run_eval_qwen.sh Qwen2.5-3B_sdora_r16_lambda0.1 sdora 16 32 model.pt 16 Qwen/Qwen2.5-3B 0.05
+#
+#   #   # Full fine-tuning (no adapters), assume outputs/Qwen2.5-3B_full-tuning/model.pt
+#   ./run_eval_qwen.sh Qwen2.5-3B_full-tuning full 16 32 model.pt 16 Qwen/Qwen2.5-3B 0.05
+#
+#
 
 # MODEL_TAG is the folder name under ../../../outputs/
 # e.g. ../../../outputs/Qwen2.5-3B_lora_r16

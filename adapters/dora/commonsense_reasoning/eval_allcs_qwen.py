@@ -110,6 +110,32 @@ def extract_answer(dataset: str, sentence: str) -> str:
     else:
         return ""
 
+def is_final_merged_checkpoint(model_dir: str, checkpoint_name: str, adapter_name: str) -> bool:
+    """
+    Heuristic to decide whether we are loading the *final merged* checkpoint
+    produced by merge_and_save(), or an intermediate training checkpoint.
+
+    Training script conventions:
+      - Final merged checkpoint:    <output_dir>/model.pt
+      - Intermediate checkpoints:   <output_dir>/checkpoint-epoch*/model.pt
+
+    We treat a checkpoint as "final merged" if:
+      1) The basename is exactly "model.pt"
+      2) No extra subdirectory in checkpoint_name (i.e., not "checkpoint-*/model.pt")
+      3) The file actually exists at model_dir/checkpoint_name
+    """
+    adapter = adapter_name.lower()
+    base_name = os.path.basename(checkpoint_name)
+    subdir = os.path.dirname(checkpoint_name)
+
+    # Only when the user passes "model.pt" directly (no subdir) we consider it final merged.
+    if base_name == "model.pt" and subdir == "":
+        ckpt_path = os.path.join(model_dir, checkpoint_name)
+        if os.path.exists(ckpt_path):
+            return True
+
+    return False
+
 
 # -----------------------------
 # Model loading
@@ -135,9 +161,46 @@ def load_model_and_tokenizer(
     if target_modules is None:
         # Must match training script
         target_modules = ["q_proj", "k_proj", "v_proj", "up_proj", "down_proj"]
+    
+    if adapter_name.lower() == "full":
+        print(f"[FULL] Loading tokenizer from base model: {base_model}")
+        tokenizer = AutoTokenizer.from_pretrained(
+            base_model,
+            trust_remote_code=True,
+        )
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = 0
+
+        print(f"[FULL] Loading base model from HF: {base_model}")
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            trust_remote_code=True,
+            device_map=None,
+        )
+        print("[FULL] Base model loaded.")
+
+        ckpt_path = os.path.join(model_dir, checkpoint_name)
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"[FULL] Checkpoint not found at: {ckpt_path}")
+
+        print(f"[FULL] Loading finetuned FULL weights from: {ckpt_path}")
+        state = torch.load(ckpt_path, map_location="cpu")
+
+        missing, unexpected = model.load_state_dict(state, strict=True)
+        if missing:
+            print("[FULL][WARN] Missing keys when loading state_dict:", missing[:20], "...")
+        if unexpected:
+            print("[FULL][WARN] Unexpected keys when loading state_dict:", unexpected[:20], "...")
+
+        model.to(device)
+        model.eval()
+        print("[FULL] Model loaded and set to eval(). No adapters injected.\n")
+        return tokenizer, model
 
     # 1) Load tokenizer from finetuned directory to keep added tokens and template
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = 0
@@ -150,8 +213,33 @@ def load_model_and_tokenizer(
         trust_remote_code=True,
         device_map=None,
     )
+    print("Base model loaded.")
 
-    # 3) Rebuild the same adapter structure used during finetuning
+    # 3) Load finetuned weights
+    ckpt_path = os.path.join(model_dir, checkpoint_name)
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
+
+    print(f"Loading finetuned weights from: {ckpt_path}")
+    state = torch.load(ckpt_path, map_location="cpu")
+
+    # ---- Decide whether this is a "final merged" checkpoint ----
+    is_final_merged = is_final_merged_checkpoint(model_dir, checkpoint_name, adapter_name)
+
+    # Debug prints
+    print(f"[DEBUG] Adapter       : {adapter_name}")
+    print(f"[DEBUG] model_dir     : {model_dir}")
+    print(f"[DEBUG] checkpoint    : {checkpoint_name}")
+    print(f"[DEBUG] final_merged? : {is_final_merged}")
+
+
+    init_as_merged = False
+    if adapter_name in ["sora", "sdora"]:
+        init_as_merged = True
+    elif adapter_name in ["lora", "dora"] and is_final_merged:
+        init_as_merged = True
+
+    # 4) Rebuild the same adapter structure used during finetuning
     model = replace_linear_with_lora(
         model,
         target_modules=target_modules,
@@ -159,16 +247,9 @@ def load_model_and_tokenizer(
         r=lora_r,
         lora_alpha=lora_alpha,
         lora_dropout=lora_dropout,
-        init_as_merged=True if adapter_name.lower() in ["sora", "sdora"] else False,
+        init_as_merged=init_as_merged,
     )
 
-    # 4) Load finetuned weights
-    ckpt_path = os.path.join(model_dir, checkpoint_name)
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found at: {ckpt_path}")
-
-    print(f"Loading finetuned weights from: {ckpt_path}")
-    state = torch.load(ckpt_path, map_location="cpu")
     
     def is_sora_gate_param(name: str) -> bool:
         # True SoRA gate params look like "...something.gate"
@@ -176,23 +257,22 @@ def load_model_and_tokenizer(
         return last == "gate"
 
     adapter = adapter_name.lower()
-    if adapter in ["sora", "sdora"]:
-        # Filter out SoRA-specific low-rank branch parameters
+    if adapter in ["sora", "sdora"] or (adapter in ["lora", "dora"] and is_final_merged):
         filtered_state = {}
         for k, v in state.items():
-            # Drop lora_A / lora_B tensors
+            # Drop low-rank tensors
             if "lora_A" in k or "lora_B" in k:
                 continue
-            # Drop true gate tensors (ending with ".gate")
-            if is_sora_gate_param(k):
+            # Only drop gate tensors for SoRA / SDoRA
+            if adapter in ["sora", "sdora"] and is_sora_gate_param(k):
                 continue
-            # Keep everything else (including gate_proj.weight etc.)
             filtered_state[k] = v
 
         to_load = filtered_state
         print(f"[INFO] Using filtered state_dict for {adapter_name} (size={len(to_load)})")
     else:
-        # For plain LoRA / DoRA we keep the entire state_dict
+        # For unmerged LoRA / DoRA (intermediate checkpoints), keep the full state_dict
+        # to preserve the exact train-time adapter structure.
         to_load = state
         print(f"[INFO] Using full state_dict for {adapter_name} (size={len(to_load)})")
 
@@ -204,6 +284,17 @@ def load_model_and_tokenizer(
         print("[WARN] Unexpected keys when loading state_dict:", unexpected[:20], "...")
 
     model.to(device)
+
+    print("\n=== DoRA Module Status Check ===")
+    for name, module in model.named_modules():
+        if hasattr(module, 'merged'):
+            print(f"{name}: merged={module.merged}")
+            if hasattr(module, 'weight_m_wdecomp'):
+                mag_mean = module.weight_m_wdecomp.weight.mean().item()
+                mag_std = module.weight_m_wdecomp.weight.std().item()
+                print(f"  magnitude: mean={mag_mean:.4f}, std={mag_std:.4f}")
+            break 
+    print("="*35 + "\n")
     model.eval()
     return tokenizer, model
 
@@ -333,7 +424,7 @@ def evaluate_all(
     results to experiment/results.csv.
 
     Each row in results.csv has:
-      model_tag, dataset, correct, total, accuracy
+      model_tag, checkpoint, dataset, correct, total, accuracy
     """
     if datasets is None:
         datasets = DEFAULT_DATASETS
@@ -345,13 +436,24 @@ def evaluate_all(
     with open(results_csv, "a", newline="") as f:
         writer = csv.writer(f)
         if not csv_exists:
-            writer.writerow(["model", "dataset", "correct", "total", "accuracy"])
+            # Add checkpoint column so that different epochs/checkpoints are distinguishable
+            writer.writerow(["model", "checkpoint", "dataset", "correct", "total", "accuracy"])
 
         model_tag = os.path.basename(model_dir.rstrip("/"))
 
+        # Derive a human-readable checkpoint tag from checkpoint_name
+        #   "model.pt"                          -> "model.pt"
+        #   "checkpoint-epoch3/model.pt"       -> "checkpoint-epoch3"
+        #   "checkpoint-epoch3-step3000/model.pt" -> "checkpoint-epoch3-step3000"
+        ckpt_dirname = os.path.dirname(checkpoint_name)
+        if ckpt_dirname == "":
+            ckpt_tag = os.path.basename(checkpoint_name)
+        else:
+            ckpt_tag = ckpt_dirname
+
         for ds in datasets:
             print("\n" + "=" * 70)
-            print(f"Evaluating dataset: {ds} for model: {model_tag}")
+            print(f"Evaluating dataset: {ds} for model: {model_tag} ({ckpt_tag})")
             print("=" * 70)
 
             correct, total, acc = evaluate_dataset(
@@ -366,8 +468,8 @@ def evaluate_all(
                 batch_size=batch_size,
             )
 
-            writer.writerow([model_tag, ds, correct, total, f"{acc:.4f}"])
-            print(f"[RESULT] {model_tag} | {ds} | acc={acc:.4f}")
+            writer.writerow([model_tag, ckpt_tag, ds, correct, total, f"{acc:.4f}"])
+            print(f"[RESULT] {model_tag} | {ckpt_tag} | {ds} | acc={acc:.4f}")
             print("-" * 70)
 
 
@@ -401,7 +503,7 @@ def parse_args():
         "--adapter_name",
         type=str,
         default="lora",
-        choices=["lora", "sora", "dora", "sdora"],
+        choices=["lora", "sora", "dora", "sdora", "full"],
         help="Adapter type used during finetuning.",
     )
     parser.add_argument("--lora_r", type=int, default=16)
