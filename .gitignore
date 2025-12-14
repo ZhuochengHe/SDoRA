@@ -210,8 +210,9 @@ test.*
 
 test_*
 
-out*
 
 *.log
 
 experiment/
+
+outputs
