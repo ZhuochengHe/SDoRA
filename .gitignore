@@ -213,6 +213,6 @@ test_*
 
 *.log
 
-experiment/
+experiments/
 
 outputs
