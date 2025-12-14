@@ -19,10 +19,10 @@ fi
 
 # Set learning rate based on adapter type
 if [ "$ADAPTER" = "lora" ]; then
-    LR=3e-4
+    LR=2e-4
 elif [[ "$ADAPTER" = "sdora" || "$ADAPTER" = "sora" ]]; then
-    LR=6e-4
-    SPARSE_LAMBDA=0.1
+    LR=1e-3      
+    SPARSE_LAMBDA=0.8
 else
     LR=2e-4
 fi

@@ -14,6 +14,7 @@ from accelerate import Accelerator
 class MetricsTracker:
     def __init__(self, output_dir):
         self.output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)  # Ensure output dir exists
         self.history = {
             'train_loss': [], 'val_loss': [],
             'epoch_time': [], 'sparsity': [],
@@ -177,9 +178,7 @@ def generate_and_tokenize_prompt(batch, tokenizer):
     return tokens
 
 
-# Dataloader Collator 保持不变
 def collate_fn(batch):
-    # 错误检查逻辑保持不变
     for i, x in enumerate(batch):
         if "input_ids" not in x:
             print(f"[collate] Missing input_ids in sample {i}: keys={list(x.keys())}")
@@ -189,7 +188,6 @@ def collate_fn(batch):
                 print("Full sample:", x)
                 raise TypeError(f"Bad input_ids type at sample {i}: {type(x['input_ids'])}")
     
-    # 填充逻辑保持不变
     max_len = max(len(x["input_ids"]) for x in batch)
     input_ids = [x["input_ids"] + [0]*(max_len-len(x["input_ids"])) for x in batch]
     attention_mask = [x["attention_mask"] + [0]*(max_len-len(x["attention_mask"])) for x in batch]
@@ -223,7 +221,7 @@ def train(
 
     gradient_accumulation_steps = batch_size // micro_batch_size
 
-    # 1. Initialize Accelerator
+    # Initialize Accelerator
     accelerator = Accelerator(
         mixed_precision="bf16",
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -248,7 +246,6 @@ def train(
     tokenizer.pad_token_id = 0
     tokenizer.padding_side = "left"
 
-    # Remove device_map="auto", let Accelerator manage devices
     model = AutoModelForCausalLM.from_pretrained(
         base_model,
         torch_dtype=torch.bfloat16,
@@ -263,13 +260,11 @@ def train(
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
 
-    # Apply adapter
     model = replace_linear_with_lora(
         model, target_modules, adapter_name, 
         r=lora_r, lora_alpha=lora_alpha, lora_dropout=lora_dropout
     )
     
-    # Save adapter config for later calculations
     adapter_config = {
         'adapter_name': adapter_name,
         'r': lora_r,
@@ -277,7 +272,6 @@ def train(
         'dropout': lora_dropout,
         'target_modules': target_modules
     }
-    # ===== DEBUG: check which params are trainable =====
     if accelerator.is_main_process:
         total_params = 0
         trainable_params = 0
@@ -306,7 +300,6 @@ def train(
             print("    [F] ", n)
         print("  NOTE: for a 'pure' LoRA setup, almost all trainable names")
         print("        should be lora_A / lora_B / gate rather than base weights.\n")
-    # ===== END DEBUG =====
 
     # Load dataset
     if data_path.endswith(".json"):
@@ -336,14 +329,13 @@ def train(
     if gate_opt:
         gate_scheduler = get_linear_schedule_with_warmup(gate_opt, num_warmup_steps=20, num_training_steps=num_steps)
 
-    # 2. Use Accelerator.prepare for unified management
+    # Use Accelerator.prepare for unified management
     model, base_opt, train_loader, val_loader, scheduler = accelerator.prepare(
         model, base_opt, train_loader, val_loader, scheduler
     )
     if gate_opt:
         gate_opt, gate_scheduler = accelerator.prepare(gate_opt, gate_scheduler)
 
-    # Metrics tracker
     tracker = MetricsTracker(output_dir)
     
     # Training loop
@@ -355,7 +347,7 @@ def train(
     model.train()
     
     # Add checkpoint save configuration
-    save_steps = 3000  # Save checkpoint every 500 steps
+    save_steps = 3000  # Save checkpoint every 3000 steps
     log_steps = 100   # Log to CSV every 100 steps
     
     for epoch in range(num_epochs):
@@ -368,12 +360,10 @@ def train(
         for step, batch in enumerate(pbar):
             batch = {k: v.to(device) for k, v in batch.items()}
             
-            # Use accelerator.accumulate for automatic gradient accumulation
             with accelerator.accumulate(model):
                 outputs = model(**batch)
                 loss = outputs.loss
                 
-                # Add L1 regularization for gate parameters (SoRA/SDoRA)
                 if adapter_config['adapter_name'].lower() in ['sora', 'sdora'] and gate_opt is not None:
                     sparse_loss = 0.0
                     p_total = 0

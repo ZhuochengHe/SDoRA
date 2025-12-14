@@ -32,7 +32,7 @@ def replace_linear_with_lora(model, target_modules, adapter_name, r=8, lora_alph
             child_name = name.split(".")[-1]
             parent = model.get_submodule(parent_name) if parent_name else model
 
-            if init_as_merged and adapter_name.lower() in ["sora", "sdora"]:
+            if init_as_merged:
                 eff_r = 0
             else:
                 eff_r = r
