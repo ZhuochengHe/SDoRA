@@ -153,7 +153,6 @@ def generate_prompt(data_point):
 
 
 def generate_and_tokenize_prompt(batch, tokenizer):
-    # 结合了原代码中的 generate_prompt 和 tokenization 逻辑
     prompts = [
         generate_prompt({
             "instruction": instr,
@@ -166,8 +165,7 @@ def generate_and_tokenize_prompt(batch, tokenizer):
             batch["output"],
         )
     ]
-    # 注意：这里 hardcode 的 max_length=256 应该与 train 参数中的 cutoff_len 保持一致，
-    # 但为简化，我们暂时保留 256
+
     tokens = tokenizer(
         prompts,
         truncation=True,
